@@ -13,7 +13,7 @@ use std::thread;
 use affinity::*;
 
 const CACHE_SIZE: usize = 64;
-const N_BLOCKS: usize = 64;
+const N_BLOCKS: usize = 8;
 const N_AVX_WORD: usize = (CACHE_SIZE*N_BLOCKS)/std::mem::size_of::<__m256i>();
 
 type Block = [__m256i; N_AVX_WORD];
@@ -58,11 +58,6 @@ impl Chunk {
             ready: AtomicBool::new(false),
             data: UnsafeCell::new(unsafe { mem::zeroed() }),
         }
-    }
-
-    // VERY UNSAFE
-    fn reset(&self) {
-        self.ready.store(false, atomic::Ordering::SeqCst);
     }
 
     fn touch_on_core(&self) {
@@ -165,13 +160,15 @@ fn ticks_to_ns(ticks: u64) -> f64 {
     (ticks as f64 * 1e6) / (tsc_freq_khz as f64)
 }
 
-fn run_test(chunks: Arc<Vec<Chunk>>, writer_core: usize, reader_cores: &'static [usize]) {
+fn run_test(writer_core: usize, reader_cores: &'static [usize]) {
+    // bind to writer for the allocation
+    set_thread_affinity(&[writer_core]).expect("failed to bind");
+    let chunks = Arc::new(std::iter::repeat(Chunk::new())
+        .take((2<<26)/N_BLOCKS)
+        .collect::<Vec<_>>());
+
     let sz = std::mem::size_of::<Block>() * chunks.len();
     let sz_mb = sz/1024/1024;
-
-    for chunk in chunks.iter() {
-        chunk.reset();
-    }
 
     let mut threads = Vec::new();
     for core in reader_cores {
@@ -183,11 +180,14 @@ fn run_test(chunks: Arc<Vec<Chunk>>, writer_core: usize, reader_cores: &'static 
     let w = thread::spawn(move || writer_thread(writer_core, &w));
 
     let writer_sec = ticks_to_ns(w.join().unwrap())/1e9;
-    println!("writer rate {}", (sz_mb as f64)/1024./writer_sec);
+    println!("writer {} rate {}",
+        writer_core,
+        (sz_mb as f64)/1024./writer_sec);
 
     for (i, reader_thread) in threads.drain(..).enumerate() {
         let reader_sec = ticks_to_ns(reader_thread.join().unwrap())/1e9;
-        println!("reader {} rate {}", reader_cores[i], (sz_mb as f64)/1024./reader_sec);
+        println!("reader {}->{} rate {}",
+            writer_core, reader_cores[i], (sz_mb as f64)/1024./reader_sec);
     }
 
     use std::time;
@@ -195,13 +195,76 @@ fn run_test(chunks: Arc<Vec<Chunk>>, writer_core: usize, reader_cores: &'static 
 }
 
 fn main() {
-    let chunks = std::iter::repeat(Chunk::new())
-        .take((2<<27)/N_BLOCKS)
-        .collect::<Vec<_>>();
+    let t1 = thread::spawn(move || {
+        run_test( 0, &[ 3, 5, 7, 9, 11, 13, 15, 17 ]);
+    });
 
-    // put it in an arc so it can satisfy thread lifetime issues
-    let chunks = Arc::new(chunks);
+    let t2 = thread::spawn(move || {
+        run_test( 1, &[ 2, 4, 6, 8, 10, 12, 14, 16 ]);
+    });
 
-    println!("\nfast tests\n");
-    run_test( chunks.clone(), 0, &[ 1, 2, 3, 4, 5, 6, 7 ]);
+    // t1.join();
+    t2.join();
+
+    // run_test( chunks.clone(), 0, &[ 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 ]);
+    // run_test( chunks.clone(), 0, &[ 2, 3, 5 ]);
+    // run_test( chunks.clone(), 0, &[ 2, 4, 6, 8, 10, 12, 14 ]);
 }
+
+/*
+ Package L#0
+    NUMANode L#0 (P#0 16GB)
+    L3 L#0 (20MB)
+      L2 L#0 (256KB) + L1d L#0 (32KB) + L1i L#0 (32KB) + Core L#0
+        PU L#0 (P#0)
+        PU L#1 (P#16)
+      L2 L#1 (256KB) + L1d L#1 (32KB) + L1i L#1 (32KB) + Core L#1
+        PU L#2 (P#2)
+        PU L#3 (P#18)
+      L2 L#2 (256KB) + L1d L#2 (32KB) + L1i L#2 (32KB) + Core L#2
+        PU L#4 (P#4)
+        PU L#5 (P#20)
+      L2 L#3 (256KB) + L1d L#3 (32KB) + L1i L#3 (32KB) + Core L#3
+        PU L#6 (P#6)
+        PU L#7 (P#22)
+      L2 L#4 (256KB) + L1d L#4 (32KB) + L1i L#4 (32KB) + Core L#4
+        PU L#8 (P#8)
+        PU L#9 (P#24)
+      L2 L#5 (256KB) + L1d L#5 (32KB) + L1i L#5 (32KB) + Core L#5
+        PU L#10 (P#10)
+        PU L#11 (P#26)
+      L2 L#6 (256KB) + L1d L#6 (32KB) + L1i L#6 (32KB) + Core L#6
+        PU L#12 (P#12)
+        PU L#13 (P#28)
+      L2 L#7 (256KB) + L1d L#7 (32KB) + L1i L#7 (32KB) + Core L#7
+        PU L#14 (P#14)
+        PU L#15 (P#30)
+
+  Package L#1
+    NUMANode L#1 (P#1 16GB)
+    L3 L#1 (20MB)
+      L2 L#8 (256KB) + L1d L#8 (32KB) + L1i L#8 (32KB) + Core L#8
+        PU L#16 (P#1)
+        PU L#17 (P#17)
+      L2 L#9 (256KB) + L1d L#9 (32KB) + L1i L#9 (32KB) + Core L#9
+        PU L#18 (P#3)
+        PU L#19 (P#19)
+      L2 L#10 (256KB) + L1d L#10 (32KB) + L1i L#10 (32KB) + Core L#10
+        PU L#20 (P#5)
+        PU L#21 (P#21)
+      L2 L#11 (256KB) + L1d L#11 (32KB) + L1i L#11 (32KB) + Core L#11
+        PU L#22 (P#7)
+        PU L#23 (P#23)
+      L2 L#12 (256KB) + L1d L#12 (32KB) + L1i L#12 (32KB) + Core L#12
+        PU L#24 (P#9)
+        PU L#25 (P#25)
+      L2 L#13 (256KB) + L1d L#13 (32KB) + L1i L#13 (32KB) + Core L#13
+        PU L#26 (P#11)
+        PU L#27 (P#27)
+      L2 L#14 (256KB) + L1d L#14 (32KB) + L1i L#14 (32KB) + Core L#14
+        PU L#28 (P#13)
+        PU L#29 (P#29)
+      L2 L#15 (256KB) + L1d L#15 (32KB) + L1i L#15 (32KB) + Core L#15
+        PU L#30 (P#15)
+        PU L#31 (P#31)
+*/
