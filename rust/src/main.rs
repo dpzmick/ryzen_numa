@@ -144,7 +144,8 @@ fn reader_thread(core: usize, chunks: &[Chunk]) -> u64 {
 }
 
 fn ticks_to_ns(ticks: u64) -> f64 {
-    const tsc_freq_khz: u64 = 3892231; // AMD
+    // const tsc_freq_khz: u64 = 3892231; // AMD
+    const tsc_freq_khz: u64 = 2599982; // intel xeon
     //     (freq_hz)     (ticks arg)
     //
     //      second       ticks
