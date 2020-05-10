@@ -2,7 +2,6 @@
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,12 +19,18 @@ typedef uint32_t m512 __attribute((vector_size (64)));
 static_assert( sizeof(m512)*8 == 512, "!" );
 
 static uint64_t tsc_freq_khz = 3892687; // AMD
-static uint64_t
+static inline uint64_t
 rdtscp( void )
 {
   uint32_t hi, lo;
   __asm__ volatile( "rdtscp": "=a"(lo), "=d"(hi) :: "memory", "%ecx" );
   return (uint64_t)lo | ( (uint64_t)hi << 32 );
+}
+
+static double
+ticks_to_ns( uint64_t ticks )
+{
+  return ((double)ticks * 1e6) / (tsc_freq_khz);
 }
 
 // lie to the compiler indicating that and SSE value was used
@@ -35,29 +40,40 @@ rdtscp( void )
 
 // same idea, but this time we say that the value is read from and written to
 #define TAINT(var)    __asm__ volatile( "# TAINT(" #var ")" : "+g"(var) : "g"(var) )
+
 #define ARRAY_SIZE(v) (sizeof(v)/sizeof(*v))
 
 #define CACHE_LINE  (64ul)
-#define N_CORES     (8ul)
+#define N_CORES     (16ul)
 
 // how many chunks to put in the memory segment
-#define N_CHUNKS    (8192ul*1024ul)
+#define N_CHUNKS    (8192ul)
 
 // how many cache lines to read/write for each synchronized chunk
-#define CHUNK_LINES (8ul)
+#define CHUNK_LINES (32ul)
+
+// type to use in chunk
+#define CHUNK_ELEMENT_T m128
+
+// compute the number of elements needed to fit in N cache lines
+#define N_ELTS ( (CACHE_LINE*CHUNK_LINES)/sizeof( CHUNK_ELEMENT_T ) )
+
+#define TRANSFER_MB ( ( N_CHUNKS*N_ELTS*sizeof( CHUNK_ELEMENT_T ) )/1024/1024 )
+
+#define TRIALS (50)
 
 typedef struct {
-                       atomic_bool ready;
-  _Alignas(CACHE_LINE) char        space[ 4*CACHE_LINE ];
-  _Alignas(CACHE_LINE) m128        data[ (CACHE_LINE*CHUNK_LINES)/sizeof( m128 ) ];
-} chunk_t;
+  uint64_t ready;
+  char     pad[ CACHE_LINE- sizeof( uint64_t ) ];
+} ready_bit_t;
 
 typedef struct {
-  size_t   core;
-  chunk_t* chunks;
-} thread_args_t;
+  _Alignas(CACHE_LINE) ready_bit_t     readies[ N_CHUNKS ];
+  _Alignas(CACHE_LINE) CHUNK_ELEMENT_T datas[ N_CHUNKS ][ N_ELTS ];
+} q_t;
 
-void bind( uint64_t id )
+static void __attribute__((noinline))
+bind( uint64_t id )
 {
   cpu_set_t cpu_set;
   CPU_ZERO( &cpu_set );
@@ -69,236 +85,224 @@ void bind( uint64_t id )
   }
 }
 
-void __attribute((noinline))
-walk( chunk_t* chunks )
+static void __attribute__((noinline))
+walk( char* mem, size_t sz )
 {
-  // touch every cache line to bring them all into local cpu's closest
-  // caches. doesn't opt out due to char*
+  // touch every cache line to:
+  // 1) make sure pages are allocated by kernel.
+  // 2) bring mem into local cpu caches
 
-  char* bytes = (char*)chunks;
-  for( size_t i = 0; i < sizeof( chunk_t )*N_CHUNKS; i += CACHE_LINE ) {
-    char tmp = bytes[i];
-    TAINT(tmp); // without this, the compiler removes the load/store
-    bytes[i] = tmp;
+  for( size_t i = 0; i < sz; i += CACHE_LINE ) {
+    char tmp = mem[i];
+    TAINT(tmp); // without this, the compiler removes the load and store
+    mem[i] = tmp;
   }
-
-  /* here's what we're getting, which is correct!
-	movzbl	(%rdi), %eax	# MEM[base: _11, offset: 0B], tmp
-	# TAINT(tmp)
-	movb	%al, (%rdi)	# tmp, MEM[base: _11, offset: 0B]
-  */
 }
 
-void* writer_thread( void* arg )
+typedef struct {
+  size_t       core;
+  uint32_t*    wtr_ready;
+  uint32_t*    rdr_ready;
+  q_t*         q;
+  double*      out_rate;
+} thread_args_t;
+
+void*
+writer_thread( void* arg )
 {
-  thread_args_t* args   = arg;
-  uint64_t       core   = args->core;
-  chunk_t*       chunks = args->chunks;
+  thread_args_t* args      = arg;
+  uint64_t       core      = args->core;
+  q_t*           q         = args->q;
+  uint32_t*      wtr_ready = args->wtr_ready;
+  uint32_t*      rdr_ready = args->rdr_ready;
 
   bind( core );
-  walk( chunks );
-
-  m128**        data_ptrs  = malloc( N_CHUNKS*sizeof( m128* ) );
-  atomic_bool** ready_ptrs = malloc( N_CHUNKS*sizeof( atomic_bool* ) );
-  for( size_t i = 0; i < N_CHUNKS; ++i ) {
-    data_ptrs[i]  = chunks[i].data;
-    ready_ptrs[i] = &chunks[i].ready;
-  }
+  walk( (char*)q->readies, sizeof( *q->readies )*N_CHUNKS );
 
   // the value that we will be sending to the other core
-  m128 v1 = {1, 2, 3, 4};
+#if CHUNK_ELEMENT_T == m128
+  CHUNK_ELEMENT_T v1 = {1, 2, 3, 4};
+#elif CHUNK_ELEMENT_T == m256
+  CHUNK_ELEMENT_T v1 = {1, 2, 3, 4, 5, 6, 7, 8};
+#else
+#error "unimpl chunk_t" #CHUNK_T
+#endif
 
-  uint64_t start = 0;
+  __atomic_store_n( wtr_ready, 1, __ATOMIC_RELEASE );
+  while( !__atomic_load_n( rdr_ready, __ATOMIC_ACQUIRE ) ) { }
+
+  uint64_t start = rdtscp();
   for( size_t i = 0; i < N_CHUNKS; ++i ) {
-    // chunk_t*     chunk = &chunks[i];
-    m128*        data  = data_ptrs[i];
-    atomic_bool* ready = ready_ptrs[i];
+    CHUNK_ELEMENT_T* data  = q->datas[i];
+    uint64_t*        ready = &q->readies[i].ready;
 
-    // threads might not start at same time, wait until first chunk to
-    // start timing
-    if( i == 1 ) start = rdtscp();
-
-    for( size_t j = 0; j < ARRAY_SIZE( chunks[0].data ); ++j ) {
+    for( size_t j = 0; j < 1; ++j ) {
       data[j] = v1;
     }
 
     // mark the chunk as ready
-    // FIXME this has something to do with the slowdown
-    asm volatile("#NEXT_LOAD");
-    atomic_store_explicit( ready, true, memory_order_release );
+    // __atomic_store_n( ready, true, __ATOMIC_RELEASE );
+
+    uint64_t one = 1;
+    __asm__ volatile("movnti %1,%0"
+             : "=m" (*ready)
+             : "r" (one)
+             : "memory");
   }
   uint64_t end = rdtscp();
 
-  return (void*)(end-start);
+  uint64_t ticks = end-start;
+  double ns = ticks_to_ns( ticks );
+  double sec = ns/1e9;
+  *(args->out_rate) = (double)TRANSFER_MB/sec/1024;
+  return NULL;
 }
 
-void* reader_thread( void* arg )
+void*
+reader_thread( void* arg )
 {
-  thread_args_t* args   = arg;
-  uint64_t       core   = args->core;
-  chunk_t*       chunks = args->chunks;
+  thread_args_t* args      = arg;
+  uint64_t       core      = args->core;
+  q_t*           q         = args->q;
+  uint32_t*      wtr_ready = args->wtr_ready;
+  uint32_t*      rdr_ready = args->rdr_ready;
 
   bind( core );
 
-  m128 v1; // we will load into the register a lot
+  // register to load into
+  CHUNK_ELEMENT_T v1;
 
-  uint64_t start = 0;
+  while( !__atomic_load_n( wtr_ready, __ATOMIC_ACQUIRE ) ) { }
+  __atomic_store_n( rdr_ready, 1, __ATOMIC_RELEASE );
+
+  uint64_t start = rdtscp();
   for( size_t i = 0; i < N_CHUNKS; ++i ) {
-    chunk_t*     chunk = &chunks[i];
-    m128*        data  = chunk->data;
-    atomic_bool* ready = &chunk->ready;
-
-    // same idea as above, start timing late
-    if( i == 1 ) start = rdtscp();
+    CHUNK_ELEMENT_T* data  = q->datas[i];
+    uint64_t*        ready = &q->readies[i].ready;
 
     // wait until the line is ready
-    while( !atomic_load_explicit( ready, memory_order_acquire ) ) { }
+    while( !__atomic_load_n( ready, __ATOMIC_ACQUIRE ) ) { }
 
     // read the entire data section into the sse register, but don't
     // do anything with it.
     // have to convince compiler to leave this code in.
 
-    for( size_t j = 0; j < ARRAY_SIZE( chunk->data ); ++j ) {
+    for( size_t j = 0; j < N_ELTS; ++j ) {
       v1 = data[j]; SSE_USED( v1 );
     }
   }
   uint64_t end = rdtscp();
 
-  return (void*)(end-start);
+  uint64_t ticks = end-start;
+  double ns = ticks_to_ns( ticks );
+  double sec = ns/1e9;
+  *(args->out_rate) = (double)TRANSFER_MB/sec/1024;
+  return NULL;
 }
 
-static void
-run_test( size_t core1, size_t core2 )
+static double
+one_to_all( size_t core1, size_t* rdr_cores, size_t n_rdr_cores, double* out_rdr_rates )
 {
-  bind( core1 ); // allocate on writer numa node
+  bind( core1 );
 
-  chunk_t* chunks = NULL;
-  posix_memalign( (void**)&chunks, CACHE_LINE, sizeof( chunk_t )*N_CHUNKS );
-  memset( chunks, 0, sizeof( chunk_t )*N_CHUNKS );
+  q_t* q = NULL;
+  posix_memalign( (void**)&q, CACHE_LINE, sizeof( q_t ) );
+  memset( q, 0, sizeof( *q ) ); // prefault
 
-  thread_args_t writer = (thread_args_t){
-    .core = core1,
-    .chunks = chunks,
-  };
+  uint32_t      wtr_ready = 0;
+  uint32_t      rdr_ready = 0;
+  double        write_rate;
+  thread_args_t args[ n_rdr_cores+1 ];
+  pthread_t     threads[ n_rdr_cores+1 ];
 
-  thread_args_t reader = (thread_args_t){
-    .core = core2,
-    .chunks = chunks,
-  };
-
-  pthread_t threads[2];
-  uint64_t  writer_time;
-  uint64_t  reader_time;
-
-  pthread_create( &threads[0], NULL, writer_thread, (void*)&writer );
-  pthread_create( &threads[1], NULL, reader_thread, (void*)&reader );
-
-  pthread_join( threads[0], (void*)&writer_time );
-  pthread_join( threads[1], (void*)&reader_time );
-
-  double ns_per_cycle = 1./((double)(tsc_freq_khz * 1000)/1e9);
-
-  double writer_ns = ns_per_cycle*writer_time;
-  double reader_ns = ns_per_cycle*reader_time;
-
-  uint64_t mb = CHUNK_LINES*CACHE_LINE*N_CHUNKS/1024/1024;
-  double wr_sec = writer_ns/1e9;
-  double rd_sec = reader_ns/1e9;
-
-  printf( "(%zu->%zu) writer %6.2f GiB/s\n", core1, core2, (double)mb/wr_sec/1024 );
-  printf( "(%zu->%zu) reader %6.2f GiB/s\n", core1, core2, (double)mb/rd_sec/1024 );
-
-  free( chunks );
-}
-
-static void __attribute((noinline))
-bw( void ) {
-  bind( 0 );
-
-  // do a local cache copy for baseline
-  size_t sz = 2ul<<28ul;
-  char* bytes_a;
-  char* bytes_b;
-  posix_memalign( (void**)&bytes_a, CACHE_LINE, sz );
-  posix_memalign( (void**)&bytes_b, CACHE_LINE, sz );
-
-  // prefault both
-  for( size_t i = 0; i < sz; i += CACHE_LINE ) {
-    char tmp = bytes_a[i];
-    TAINT(tmp);
-    bytes_a[i] = tmp;
-
-    tmp = bytes_b[i];
-    TAINT(tmp);
-    bytes_b[i] = tmp;
+  for( size_t i = 1; i < n_rdr_cores+1; ++i ) {
+    args[i].core      = rdr_cores[i-1];
+    args[i].wtr_ready = &wtr_ready;
+    args[i].rdr_ready = &rdr_ready;
+    args[i].q         = q;
+    args[i].out_rate  = &out_rdr_rates[i-1];
   }
 
-  uint64_t start = rdtscp();
-  // memcpy is faster, but the loop is more comparable to what the rest of the
-  // code is doing
-  memcpy( bytes_a, bytes_b, sz );
-  // #define TY m128
-  // for( size_t i = 0; i < sz; i += sizeof( TY ) ) {
-  //   TY a = *(TY*)&bytes_a[i + sizeof( TY )*0];
-  //   *(TY*)&bytes_b[i + sizeof( TY )*0] = a;
-  // }
-  // #undef TY
-  uint64_t end = rdtscp();
-  double ns_per_cycle = 1./((double)(tsc_freq_khz * 1000)/1e9);
-  double ns = ns_per_cycle*(end-start);
-  printf( "simple bw = %f MiB/s\n", (double)(sz/1024/1024)/(ns/1e9) );
-  free( bytes_a );
-  free( bytes_b );
+  args[0].core      = core1;
+  args[0].wtr_ready = &wtr_ready;
+  args[0].rdr_ready = &rdr_ready;
+  args[0].q         = q;
+  args[0].out_rate  = &write_rate;
+
+  for( size_t i = 1; i < n_rdr_cores+1; ++i ) {
+    pthread_create( &threads[i], NULL, reader_thread, (void*)&args[i] );
+  }
+
+  pthread_create( &threads[0], NULL, writer_thread, (void*)&args[0] );
+
+  for( size_t i = 1; i < n_rdr_cores+1; ++i ) {
+    pthread_join( threads[i], NULL );
+  }
+
+  pthread_join( threads[0], NULL );
+  free( q );
+  return write_rate;
 }
 
 int main()
 {
-  bw();
-  printf( "\nfast tests\n" );
-  run_test( 0, 1 );
-  run_test( 1, 2 );
-  run_test( 2, 3 );
-  // 3,4 skip
-  run_test( 4, 5 );
-  run_test( 5, 6 );
-  run_test( 6, 7 );
+  FILE* writer_out = fopen("writer", "w+");
+  FILE* reader_out = fopen("reader", "w+");
 
-  printf("\nslow tests\n");
-  run_test( 0, 4 );
-  run_test( 4, 1 );
-  run_test( 1, 5 );
-  run_test( 5, 2 );
-  run_test( 2, 6 );
-  run_test( 6, 3 );
-  run_test( 3, 7 );
+  for( size_t i = 0; i < 16; ++i ) {
+    for( size_t j = 0; j < 16; ++j ) {
+      if( i == j ) continue;
+      size_t wtr = i;
+      size_t rdr = j;
+
+      double avg_wtr = 0.0;
+      double avg_rdr = 0.0;
+
+      for( size_t trial = 0; trial < TRIALS; ++trial ) {
+        double rdr_rate;
+        double wtr_rate = one_to_all( wtr, &rdr, 1, &rdr_rate );
+
+        avg_rdr += rdr_rate;
+        avg_wtr += wtr_rate;
+        /* printf("wtr: %f\n", wtr_rate); */
+        /* printf("rdr: %f\n", rdr_rate); */
+      }
+
+      fprintf( writer_out, "%zu,%zu,%f\n", i, j, avg_wtr/TRIALS);
+      fprintf( reader_out, "%zu,%zu,%f\n", i, j, avg_rdr/TRIALS);
+
+      printf( "wtr[%2zu] = %f\n", wtr, avg_wtr/TRIALS );
+      printf( "rdr[%2zu] = %f\n", rdr, avg_rdr/TRIALS );
+      printf( "\n" );
+    }
+  }
+
+  fclose( reader_out );
+  fclose( writer_out );
+
+  /* size_t wtr   = 0; */
+  /* size_t rdr[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}; */
+  /* double cum_rate[ ARRAY_SIZE( rdr ) ]; */
+  /* memset( cum_rate, 0, sizeof( cum_rate ) ); */
+
+  /* for( size_t i = 1; i < ARRAY_SIZE( rdr ); ++i ) { */
+  /*   double cum_wtr = 0.0; */
+  /*   for( size_t trial = 0; trial < 100; ++trial ) { */
+  /*     double rdr_rate[ ARRAY_SIZE( rdr ) ]; */
+  /*     double rate = one_to_all( wtr, rdr, i, rdr_rate ); */
+  /*     cum_wtr += rate; */
+  /*     for( size_t x = 0; x < ARRAY_SIZE( rdr_rate ); ++x ) { */
+  /*       cum_rate[ x ] += rdr_rate[ x ]; */
+  /*     } */
+  /*   } */
+
+  /*   printf( "wtr[%2zu] = %f\n", wtr, cum_wtr/100 ); */
+  /*   for( size_t j = 0; j < i; ++j ) { */
+  /*     // lies due to some readers starting late */
+  /*     if( cum_rate[j]/100 < cum_wtr/100 ) { */
+  /*       printf( "rdr[%2zu] = %f\n", rdr[ j ], cum_rate[ j ]/100 ); */
+  /*     } */
+  /*   } */
+  /*   printf("\n"); */
+  /* } */
 }
-
-/* AMD Ryzen 7 3800X 8-Core Processor
-
-  L3 L#0 (16MB)
-      L2 L#0 (512KB) + L1d L#0 (32KB) + L1i L#0 (32KB) + Core L#0
-        PU L#0 (P#0)
-        PU L#1 (P#8)
-      L2 L#1 (512KB) + L1d L#1 (32KB) + L1i L#1 (32KB) + Core L#1
-        PU L#2 (P#1)
-        PU L#3 (P#9)
-      L2 L#2 (512KB) + L1d L#2 (32KB) + L1i L#2 (32KB) + Core L#2
-        PU L#4 (P#2)
-        PU L#5 (P#10)
-      L2 L#3 (512KB) + L1d L#3 (32KB) + L1i L#3 (32KB) + Core L#3
-        PU L#6 (P#3)
-        PU L#7 (P#11)
-   L3 L#1 (16MB)
-      L2 L#4 (512KB) + L1d L#4 (32KB) + L1i L#4 (32KB) + Core L#4
-        PU L#8 (P#4)
-        PU L#9 (P#12)
-      L2 L#5 (512KB) + L1d L#5 (32KB) + L1i L#5 (32KB) + Core L#5
-        PU L#10 (P#5)
-        PU L#11 (P#13)
-      L2 L#6 (512KB) + L1d L#6 (32KB) + L1i L#6 (32KB) + Core L#6
-        PU L#12 (P#6)
-        PU L#13 (P#14)
-      L2 L#7 (512KB) + L1d L#7 (32KB) + L1i L#7 (32KB) + Core L#7
-        PU L#14 (P#7)
-        PU L#15 (P#15)
-*/
